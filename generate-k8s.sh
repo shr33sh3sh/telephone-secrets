@@ -1,341 +1,591 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+################################################################################
+# Interactive Kubernetes Manifest Generator
+# 
+# Scans a project directory for Dockerfile, .env, and init.sql files,
+# then generates appropriate Kubernetes manifests based on what's found.
+################################################################################
+
+# Color codes for better UX
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly YELLOW='\033[1;33m'
+readonly RED='\033[0;31m'
+readonly NC='\033[0m' # No Color
+
+# Configuration
 ROOT_DIR="${1:-.}"
-
-TAG="$(printf "%05d" $((RANDOM % 1000000)))"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 PARENT_NAME="$(basename "$(realpath "$ROOT_DIR")")"
-K8S_OUT_DIR="$ROOT_DIR/k8s-manifests"
+K8S_OUT_DIR="$ROOT_DIR/k8s-manifests-$TIMESTAMP"
 
-mkdir -p "$K8S_OUT_DIR"
+# Helper functions
+print_header() {
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
 
-echo "📦 Project: $PARENT_NAME"
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_info() {
+    echo -e "${YELLOW}ℹ️  $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+trim() { 
+    echo "$1" | awk '{$1=$1};1'; 
+}
+
+################################################################################
+# STEP 1: Project Discovery
+################################################################################
+print_header "📦 STEP 1: Project Discovery"
+echo "Project: $PARENT_NAME"
+echo "Scanning directory: $ROOT_DIR"
 echo
 
-############################################
-# Helpers
-############################################
-trim() { awk '{$1=$1};1'; }
+# Find Dockerfiles
+echo "🔍 Scanning for Dockerfiles..."
+mapfile -t DOCKERFILES < <(find "$ROOT_DIR" -type f -iname "Dockerfile" 2>/dev/null || true)
+if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+    print_success "Found ${#DOCKERFILES[@]} Dockerfile(s):"
+    for df in "${DOCKERFILES[@]}"; do
+        echo "   📄 ${df#$ROOT_DIR/}"
+    done
+else
+    print_info "No Dockerfiles found"
+fi
+echo
 
-############################################
-# Interactive config
-############################################
-read -p "📦 PostgreSQL PVC size (default: 10Gi): " PVC_SIZE
+# Find .env files
+echo "🔍 Scanning for .env files..."
+mapfile -t ENV_FILES < <(find "$ROOT_DIR" -type f \( -iname ".env" -o -iname ".env.*" \) ! -iname "*.example" 2>/dev/null || true)
+if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
+    print_success "Found ${#ENV_FILES[@]} .env file(s):"
+    for ef in "${ENV_FILES[@]}"; do
+        echo "   📄 ${ef#$ROOT_DIR/}"
+    done
+else
+    print_info "No .env files found"
+fi
+echo
+
+# Find init.sql files
+echo "🔍 Scanning for init.sql files..."
+mapfile -t INIT_SQL_FILES < <(find "$ROOT_DIR" -type f -iname "init.sql" 2>/dev/null || true)
+if [[ ${#INIT_SQL_FILES[@]} -gt 0 ]]; then
+    print_success "Found ${#INIT_SQL_FILES[@]} init.sql file(s):"
+    for sql in "${INIT_SQL_FILES[@]}"; do
+        echo "   📄 ${sql#$ROOT_DIR/}"
+    done
+else
+    print_info "No init.sql files found"
+fi
+echo
+
+################################################################################
+# STEP 2: Interactive Configuration
+################################################################################
+print_header "⚙️  STEP 2: Configuration"
+
+# Repository name (becomes namespace)
+read -p "🏷️  Repository/Namespace name (default: ${PARENT_NAME}): " REPO_NAME
+REPO_NAME="${REPO_NAME:-$PARENT_NAME}"
+# Sanitize: lowercase, replace underscores with hyphens, remove invalid chars
+NAMESPACE="$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' | sed 's/^-//;s/-$//')"
+print_success "Namespace: $NAMESPACE"
+echo
+
+# PVC size
+read -p "💾 PVC size for persistent storage (default: 10Gi): " PVC_SIZE
 PVC_SIZE="${PVC_SIZE:-10Gi}"
+print_success "PVC Size: $PVC_SIZE"
+echo
 
-read -p "🏷️  Kubernetes namespace (default: ${PARENT_NAME}): " NAMESPACE
-NAMESPACE="${NAMESPACE:-$PARENT_NAME}"
-NAMESPACE="$(echo "$NAMESPACE" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+################################################################################
+# STEP 3: Generate Manifests
+################################################################################
+print_header "📝 STEP 3: Generating Kubernetes Manifests"
+mkdir -p "$K8S_OUT_DIR"
+print_success "Output directory created: $K8S_OUT_DIR"
+echo
 
-read -p "🌐 Public hostname (Ingress) (default: ${PARENT_NAME}.local): " HOSTNAME
-HOSTNAME="${HOSTNAME:-${PARENT_NAME}.local}"
+MANIFESTS_CREATED=()
 
-############################################
-# Namespace
-############################################
+# --- Namespace (always created) ---
+echo "📄 Generating namespace.yaml..."
 cat > "$K8S_OUT_DIR/namespace.yaml" <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
   name: $NAMESPACE
+  labels:
+    name: $NAMESPACE
 EOF
+MANIFESTS_CREATED+=("namespace.yaml")
+print_success "Created: namespace.yaml"
+echo
 
-############################################
-# Parse .env files
-############################################
+# --- Parse .env files if present ---
 declare -A CONFIG_VARS
 declare -A SECRET_VARS
 
-mapfile -t ENV_FILES < <(find "$ROOT_DIR" -type f -iname ".env*" ! -iname "*.example")
+if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
+    echo "🔐 Parsing .env files..."
+    for ENV_FILE in "${ENV_FILES[@]}"; do
+        while IFS='=' read -r KEY VALUE || [[ -n "$KEY" ]]; do
+            # Trim whitespace
+            KEY="$(trim "$KEY")"
+            # Skip empty lines and comments
+            [[ -z "$KEY" || "$KEY" =~ ^# ]] && continue
+            # Trim and remove quotes from value
+            VALUE="$(trim "$VALUE")"
+            VALUE="${VALUE#\"}"
+            VALUE="${VALUE%\"}"
+            VALUE="${VALUE#\'}"
+            VALUE="${VALUE%\'}"
 
-for ENV_FILE in "${ENV_FILES[@]}"; do
-  while IFS='=' read -r KEY VALUE || [[ -n "$KEY" ]]; do
-    KEY="$(echo "$KEY" | trim)"
-    [[ -z "$KEY" || "$KEY" =~ ^# ]] && continue
-    VALUE="$(echo "${VALUE:-}" | trim | sed 's/^["'\'']//;s/["'\'']$//')"
+            # Classify as secret or config
+            if [[ "$KEY" =~ (PASSWORD|TOKEN|KEY|SECRET|API_KEY) ]]; then
+                SECRET_VARS["$KEY"]="$VALUE"
+            else
+                CONFIG_VARS["$KEY"]="$VALUE"
+            fi
+        done < "$ENV_FILE"
+    done
+    print_success "Parsed ${#CONFIG_VARS[@]} config variables and ${#SECRET_VARS[@]} secret variables"
+    echo
+fi
 
-    if [[ "$KEY" =~ (PASS|PASSWORD|TOKEN|SECRET|KEY|USER) ]]; then
-      SECRET_VARS["$KEY"]="$VALUE"
-    else
-      CONFIG_VARS["$KEY"]="$VALUE"
-    fi
-  done < "$ENV_FILE"
-done
+# --- ConfigMap (only if .env exists) ---
+if [[ ${#ENV_FILES[@]} -gt 0 && ${#CONFIG_VARS[@]} -gt 0 ]]; then
+    echo "📄 Generating configmap.yaml..."
+    cat > "$K8S_OUT_DIR/configmap.yaml" <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${NAMESPACE}-config
+  namespace: $NAMESPACE
+data:
+EOF
+    for K in "${!CONFIG_VARS[@]}"; do
+        echo "  $K: \"${CONFIG_VARS[$K]}\"" >> "$K8S_OUT_DIR/configmap.yaml"
+    done
+    MANIFESTS_CREATED+=("configmap.yaml")
+    print_success "Created: configmap.yaml (${#CONFIG_VARS[@]} variables)"
+    echo
+fi
 
-############################################
-# PostgreSQL (StatefulSet)
-############################################
-CONFIG_VARS["DB_HOST"]="${PARENT_NAME}-postgres"
-CONFIG_VARS["DB_PORT"]="5432"
+# --- Secret (only if .env exists and has secrets) ---
+if [[ ${#ENV_FILES[@]} -gt 0 && ${#SECRET_VARS[@]} -gt 0 ]]; then
+    echo "📄 Generating secret.yaml..."
+    cat > "$K8S_OUT_DIR/secret.yaml" <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${NAMESPACE}-secret
+  namespace: $NAMESPACE
+type: Opaque
+stringData:
+EOF
+    for K in "${!SECRET_VARS[@]}"; do
+        echo "  $K: \"${SECRET_VARS[$K]}\"" >> "$K8S_OUT_DIR/secret.yaml"
+    done
+    MANIFESTS_CREATED+=("secret.yaml")
+    print_success "Created: secret.yaml (${#SECRET_VARS[@]} secrets)"
+    echo
+fi
 
-cat > "$K8S_OUT_DIR/postgres.yaml" <<EOF
+# --- Deployments and Services (only if Dockerfile exists) ---
+if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+    echo "🚢 Generating Deployments and Services..."
+    
+    for DF in "${DOCKERFILES[@]}"; do
+        DIR="$(dirname "$DF")"
+        DIR_NAME="$(basename "$DIR")"
+        
+        # Determine service type
+        if grep -qi nginx "$DF" 2>/dev/null || grep -qi "EXPOSE 80" "$DF" 2>/dev/null; then
+            SERVICE_TYPE="frontend"
+        elif grep -qi python "$DF" 2>/dev/null || grep -qi flask "$DF" 2>/dev/null || grep -qi node "$DF" 2>/dev/null; then
+            SERVICE_TYPE="backend"
+        else
+            SERVICE_TYPE="$DIR_NAME"
+        fi
+        
+        # Extract port from Dockerfile
+        PORT=$(grep -i '^EXPOSE ' "$DF" 2>/dev/null | awk '{print $2}' | head -1 || echo "")
+        PORT="${PORT:-8080}"
+        
+        # Generate deployment and service
+        MANIFEST_FILE="${SERVICE_TYPE}-deployment.yaml"
+        echo "📄 Generating $MANIFEST_FILE..."
+        
+        cat > "$K8S_OUT_DIR/$MANIFEST_FILE" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${NAMESPACE}-${SERVICE_TYPE}
+  namespace: $NAMESPACE
+  labels:
+    app: ${SERVICE_TYPE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${SERVICE_TYPE}
+  template:
+    metadata:
+      labels:
+        app: ${SERVICE_TYPE}
+    spec:
+      containers:
+      - name: ${SERVICE_TYPE}
+        image: ${NAMESPACE}-${SERVICE_TYPE}:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: $PORT
+EOF
+
+        # Add env from ConfigMap/Secret only if they exist
+        if [[ ${#CONFIG_VARS[@]} -gt 0 || ${#SECRET_VARS[@]} -gt 0 ]]; then
+            cat >> "$K8S_OUT_DIR/$MANIFEST_FILE" <<EOF
+        envFrom:
+EOF
+            [[ ${#CONFIG_VARS[@]} -gt 0 ]] && cat >> "$K8S_OUT_DIR/$MANIFEST_FILE" <<EOF
+        - configMapRef:
+            name: ${NAMESPACE}-config
+EOF
+            [[ ${#SECRET_VARS[@]} -gt 0 ]] && cat >> "$K8S_OUT_DIR/$MANIFEST_FILE" <<EOF
+        - secretRef:
+            name: ${NAMESPACE}-secret
+EOF
+        fi
+
+        # Add service
+        cat >> "$K8S_OUT_DIR/$MANIFEST_FILE" <<EOF
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${PARENT_NAME}-postgres
+  name: ${NAMESPACE}-${SERVICE_TYPE}-service
   namespace: $NAMESPACE
+  labels:
+    app: ${SERVICE_TYPE}
+spec:
+  selector:
+    app: ${SERVICE_TYPE}
+  ports:
+  - protocol: TCP
+    port: $PORT
+    targetPort: $PORT
+  type: ClusterIP
+EOF
+        
+        MANIFESTS_CREATED+=("$MANIFEST_FILE")
+        print_success "Created: $MANIFEST_FILE (port: $PORT)"
+    done
+    echo
+fi
+
+# --- Database StatefulSet (only if init.sql does NOT exist) ---
+if [[ ${#INIT_SQL_FILES[@]} -eq 0 ]]; then
+    echo "🗄️  No init.sql found - generating database StatefulSet..."
+    echo "📄 Generating postgres-statefulset.yaml..."
+    
+    cat > "$K8S_OUT_DIR/postgres-statefulset.yaml" <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${NAMESPACE}-postgres
+  namespace: $NAMESPACE
+  labels:
+    app: postgres
 spec:
   clusterIP: None
   selector:
-    app: ${PARENT_NAME}-postgres
+    app: postgres
   ports:
   - port: 5432
+    targetPort: 5432
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: ${PARENT_NAME}-postgres
+  name: ${NAMESPACE}-postgres
   namespace: $NAMESPACE
 spec:
-  serviceName: ${PARENT_NAME}-postgres
+  serviceName: ${NAMESPACE}-postgres
   replicas: 1
   selector:
     matchLabels:
-      app: ${PARENT_NAME}-postgres
+      app: postgres
   template:
     metadata:
       labels:
-        app: ${PARENT_NAME}-postgres
+        app: postgres
     spec:
       containers:
       - name: postgres
-        image: postgres:16
+        image: postgres:16-alpine
         ports:
         - containerPort: 5432
         env:
         - name: POSTGRES_DB
-          valueFrom:
-            configMapKeyRef:
-              name: ${PARENT_NAME}-config
-              key: DB_NAME
+          value: "${NAMESPACE}_db"
         - name: POSTGRES_USER
           valueFrom:
             secretKeyRef:
-              name: ${PARENT_NAME}-secret
+              name: ${NAMESPACE}-secret
               key: DB_USER
+              optional: true
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: ${PARENT_NAME}-secret
+              name: ${NAMESPACE}-secret
               key: DB_PASSWORD
+              optional: true
         volumeMounts:
-        - name: data
+        - name: postgres-data
           mountPath: /var/lib/postgresql/data
   volumeClaimTemplates:
   - metadata:
-      name: data
+      name: postgres-data
     spec:
       accessModes: ["ReadWriteOnce"]
       resources:
         requests:
           storage: $PVC_SIZE
 EOF
+    
+    MANIFESTS_CREATED+=("postgres-statefulset.yaml")
+    print_success "Created: postgres-statefulset.yaml (PVC: $PVC_SIZE)"
+    echo
+else
+    print_info "Skipping database StatefulSet (init.sql found - assuming external/managed database)"
+    echo
+fi
 
-############################################
-# ConfigMap + Secret
-############################################
-cat > "$K8S_OUT_DIR/config.yaml" <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ${PARENT_NAME}-config
-  namespace: $NAMESPACE
-data:
-EOF
-
-for K in "${!CONFIG_VARS[@]}"; do
-  echo "  $K: \"${CONFIG_VARS[$K]}\"" >> "$K8S_OUT_DIR/config.yaml"
-done
-
-cat > "$K8S_OUT_DIR/secret.yaml" <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${PARENT_NAME}-secret
-  namespace: $NAMESPACE
-type: Opaque
-stringData:
-EOF
-
-for K in "${!SECRET_VARS[@]}"; do
-  echo "  $K: \"${SECRET_VARS[$K]}\"" >> "$K8S_OUT_DIR/secret.yaml"
-done
-
-############################################
-# Dockerfiles → Backend / Frontend
-############################################
-mapfile -t DOCKERFILES < <(find "$ROOT_DIR" -iname Dockerfile)
-
-for FILE in "${DOCKERFILES[@]}"; do
-  DIR="$(dirname "$FILE")"
-
-  if grep -qi nginx "$FILE" || grep -qi "EXPOSE 80" "$FILE"; then
-    TYPE="frontend"
-  else
-    TYPE="backend"
-  fi
-
-  IMAGE="${PARENT_NAME}-${TYPE}:${TAG}"
-  docker build -t "$IMAGE" "$DIR" || true
-
-  PORT=$(grep -i '^EXPOSE ' "$FILE" | awk '{print $2}' | head -1)
-  PORT="${PORT:-5000}"
-
-  if [[ "$TYPE" == "frontend" ]]; then
-    CONFIG_VARS["BACKEND_URL"]="http://${PARENT_NAME}-backend-service"
-  fi
-
-  cat > "$K8S_OUT_DIR/${TYPE}.yaml" <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${PARENT_NAME}-${TYPE}
-  namespace: $NAMESPACE
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ${PARENT_NAME}-${TYPE}
-  template:
-    metadata:
-      labels:
-        app: ${PARENT_NAME}-${TYPE}
-    spec:
-      containers:
-      - name: ${TYPE}
-        image: $IMAGE
-        ports:
-        - containerPort: $PORT
-        envFrom:
-        - configMapRef:
-            name: ${PARENT_NAME}-config
-        - secretRef:
-            name: ${PARENT_NAME}-secret
-EOF
-
-  if [[ "$TYPE" == "frontend" ]]; then
-    cat >> "$K8S_OUT_DIR/${TYPE}.yaml" <<EOF
-        command:
-        - /bin/sh
-        - -c
-        - |
-          echo "window.__ENV__ = { BACKEND_URL: '\$BACKEND_URL' };" \
-            > /usr/share/nginx/html/env.js
-          exec nginx -g 'daemon off;'
-EOF
-  fi
-
-  cat >> "$K8S_OUT_DIR/${TYPE}.yaml" <<EOF
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ${PARENT_NAME}-${TYPE}-service
-  namespace: $NAMESPACE
-spec:
-  selector:
-    app: ${PARENT_NAME}-${TYPE}
-  ports:
-  - port: 80
-    targetPort: $PORT
-EOF
-done
-
-############################################
-# Ingress
-############################################
-cat > "$K8S_OUT_DIR/ingress.yaml" <<EOF
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: ${PARENT_NAME}-ingress
-  namespace: $NAMESPACE
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: $HOSTNAME
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: ${PARENT_NAME}-frontend-service
-            port:
-              number: 80
-EOF
-
-############################################
-# Finish
-############################################
+################################################################################
+# STEP 4: Summary
+################################################################################
+print_header "🎉 Generation Complete!"
+echo "📂 Output directory: $K8S_OUT_DIR"
 echo
-echo "🎉 Kubernetes manifests generated!"
-echo "📂 Location: $K8S_OUT_DIR"
+echo "📄 Generated manifests:"
+for manifest in "${MANIFESTS_CREATED[@]}"; do
+    echo "   ✓ $K8S_OUT_DIR/$manifest"
+done
 echo
-echo "🚀 Deploy with:"
-echo "kubectl apply -f $K8S_OUT_DIR/"
+echo "🚀 To deploy:"
+echo "   kubectl apply -f $K8S_OUT_DIR/"
 echo
-echo "🌐 Access app at: http://$HOSTNAME"
+echo "🔍 To verify:"
+echo "   kubectl get all -n $NAMESPACE"
+echo
 
-############################################
-# 🚀 INTERACTIVE DEPLOYMENT
-############################################
-NS_FILE="$K8S_OUT_DIR/namespace.yaml"
+################################################################################
+# STEP 5: Interactive Deployment to Kind Cluster
+################################################################################
+echo
+read -p "📦 Do you want to deploy to a Kind cluster now? (y/N): " DEPLOY_CHOICE
 
-echo "🚀 Deployment Options"
-echo "===================="
-read -p "Do you want to deploy to Kubernetes now? (y/N): " DEPLOY_CHOICE
+if [[ ! "$DEPLOY_CHOICE" =~ ^[Yy]$ ]]; then
+    print_info "Deployment skipped. You can deploy later using: kubectl apply -f $K8S_OUT_DIR/"
+    exit 0
+fi
 
-if [[ "$DEPLOY_CHOICE" =~ ^[Yy]$ ]]; then
-  echo "📦 Deploying to Kubernetes cluster..."
-  echo
-  
-  # 1. Deploy namespace first
-  echo "1️⃣  Creating namespace: $NAMESPACE"
-  if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-    echo "   ℹ️  Namespace '$NAMESPACE' already exists"
-  else
-    kubectl apply -f "$NS_FILE"
-    echo "   ✅ Namespace created"
-  fi
-  
-  # 2. Deploy all other resources
-  echo "2️⃣  Deploying all Kubernetes resources..."
-  
-  # Get all yaml files except namespace (since we already deployed it)
-  mapfile -t YAML_FILES < <(find "$K8S_OUT_DIR" -name "*.yaml" ! -name "namespace.yaml")
-  
-  for YAML_FILE in "${YAML_FILES[@]}"; do
-    echo "   📄 Applying: $(basename "$YAML_FILE")"
-    kubectl apply -f "$YAML_FILE" --namespace="$NAMESPACE"
-  done
-  
-  echo "   ✅ All resources deployed"
-  
-  # 3. Set current context to namespace
-  echo "3️⃣  Setting current context to namespace: $NAMESPACE"
-  kubectl config set-context --current --namespace="$NAMESPACE"
-  
-  # 4. Wait for deployments to be ready
-  echo "4️⃣  Waiting for deployments to be ready..."
-  echo
-  sleep 5
-  
-  # Check deployments
-  echo "📊 Deployment Status:"
-  echo "-------------------"
-  
-  # Check Postgres if it exists
-  if kubectl get statefulset "${PARENT_NAME}-postgres" -n "$NAMESPACE" >/dev/null 2>&1; then
-  echo "🔍 Checking PostgreSQL StatefulSet..."
-  for i in {1..30}; do
-    READY=$(kubectl get statefulset "${PARENT_NAME}-postgres" -n "$NAMESPACE" \
-      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-    if [[ "$READY" == "1" ]]; then
-      echo "   ✅ PostgreSQL is ready"
-      break
+print_header "🚀 STEP 5: Deploying to Kind Cluster"
+
+# Check if kind is installed
+if ! command -v kind &> /dev/null; then
+    print_error "Kind is not installed. Please install it from https://kind.sigs.k8s.io/"
+    exit 1
+fi
+
+# Check if docker is installed
+if ! command -v docker &> /dev/null; then
+    print_error "Docker is not installed. Please install Docker first."
+    exit 1
+fi
+
+# List available Kind clusters using kubectl contexts
+echo "🔍 Checking for Kind clusters..."
+mapfile -t KIND_CONTEXTS < <(kubectl config get-contexts -o name 2>/dev/null | grep "^kind-" || echo "")
+
+if [[ ${#KIND_CONTEXTS[@]} -eq 0 || -z "${KIND_CONTEXTS[0]}" ]]; then
+    print_info "No Kind clusters found."
+    read -p "📦 Create a new Kind cluster? (y/N): " CREATE_CLUSTER
+    
+    if [[ "$CREATE_CLUSTER" =~ ^[Yy]$ ]]; then
+        read -p "🏷️  Cluster name (default: kind): " CLUSTER_NAME
+        CLUSTER_NAME="${CLUSTER_NAME:-kind}"
+        
+        echo "🔨 Creating Kind cluster '$CLUSTER_NAME'..."
+        kind create cluster --name "$CLUSTER_NAME"
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "Kind cluster '$CLUSTER_NAME' created successfully"
+            CONTEXT_NAME="kind-$CLUSTER_NAME"
+        else
+            print_error "Failed to create Kind cluster"
+            exit 1
+        fi
+    else
+        print_info "Deployment cancelled. No cluster available."
+        exit 0
     fi
-    [[ $i -eq 30 ]] && echo "   ⚠️ PostgreSQL still not ready"
-    sleep 1
-  done
-  fi
+else
+    # Get current context
+    CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "")
+    
+    echo "📋 Available Kind clusters:"
+    for i in "${!KIND_CONTEXTS[@]}"; do
+        CONTEXT="${KIND_CONTEXTS[$i]}"
+        if [[ "$CONTEXT" == "$CURRENT_CONTEXT" ]]; then
+            echo "   $((i+1)). $CONTEXT (current) ⭐"
+        else
+            echo "   $((i+1)). $CONTEXT"
+        fi
+    done
+    echo
+    
+    if [[ ${#KIND_CONTEXTS[@]} -eq 1 ]]; then
+        CONTEXT_NAME="${KIND_CONTEXTS[0]}"
+        # Extract cluster name from context (remove "kind-" prefix)
+        CLUSTER_NAME="${CONTEXT_NAME#kind-}"
+        print_info "Using cluster: $CONTEXT_NAME"
+    else
+        read -p "🏷️  Enter cluster number (default: 1): " CLUSTER_CHOICE
+        CLUSTER_CHOICE="${CLUSTER_CHOICE:-1}"
+        
+        # Check if input is a number
+        if [[ "$CLUSTER_CHOICE" =~ ^[0-9]+$ ]]; then
+            idx=$((CLUSTER_CHOICE - 1))
+            if [[ $idx -ge 0 && $idx -lt ${#KIND_CONTEXTS[@]} ]]; then
+                CONTEXT_NAME="${KIND_CONTEXTS[$idx]}"
+                CLUSTER_NAME="${CONTEXT_NAME#kind-}"
+            else
+                print_error "Invalid cluster number"
+                exit 1
+            fi
+        else
+            print_error "Please enter a valid number"
+            exit 1
+        fi
+        
+        print_success "Selected cluster: $CONTEXT_NAME"
+    fi
+fi
+echo
+
+# Set kubectl context to the Kind cluster
+echo "🔄 Setting kubectl context to $CONTEXT_NAME..."
+kubectl config use-context "$CONTEXT_NAME"
+echo
+
+# Build and load Docker images
+if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+    print_header "🐳 Building and Loading Docker Images"
+    
+    for DF in "${DOCKERFILES[@]}"; do
+        DIR="$(dirname "$DF")"
+        DIR_NAME="$(basename "$DIR")"
+        
+        # Determine service type (same logic as before)
+        if grep -qi nginx "$DF" 2>/dev/null || grep -qi "EXPOSE 80" "$DF" 2>/dev/null; then
+            SERVICE_TYPE="frontend"
+        elif grep -qi python "$DF" 2>/dev/null || grep -qi flask "$DF" 2>/dev/null || grep -qi node "$DF" 2>/dev/null; then
+            SERVICE_TYPE="backend"
+        else
+            SERVICE_TYPE="$DIR_NAME"
+        fi
+        
+        IMAGE_NAME="${NAMESPACE}-${SERVICE_TYPE}:latest"
+        
+        echo "🔨 Building image: $IMAGE_NAME"
+        echo "   📂 From: ${DIR#$ROOT_DIR/}"
+        
+        docker build -t "$IMAGE_NAME" "$DIR"
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "Built: $IMAGE_NAME"
+            
+            echo "📦 Loading image into Kind cluster '$CLUSTER_NAME'..."
+            kind load docker-image "$IMAGE_NAME" --name "$CLUSTER_NAME"
+            
+            if [[ $? -eq 0 ]]; then
+                print_success "Loaded: $IMAGE_NAME → kind-$CLUSTER_NAME"
+            else
+                print_error "Failed to load image into Kind cluster"
+                exit 1
+            fi
+        else
+            print_error "Failed to build image: $IMAGE_NAME"
+            exit 1
+        fi
+        echo
+    done
+fi
+
+# Deploy manifests to Kind cluster
+print_header "📦 Deploying Manifests to Kubernetes"
+
+# Create namespace first
+echo "1️⃣  Creating namespace: $NAMESPACE"
+kubectl apply -f "$K8S_OUT_DIR/namespace.yaml"
+echo
+
+# Deploy all other manifests
+echo "2️⃣  Deploying resources..."
+for manifest in "${MANIFESTS_CREATED[@]}"; do
+    if [[ "$manifest" != "namespace.yaml" ]]; then
+        echo "   📄 Applying: $manifest"
+        kubectl apply -f "$K8S_OUT_DIR/$manifest" -n "$NAMESPACE"
+    fi
+done
+echo
+
+# Wait for deployments to be ready
+if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+    echo "3️⃣  Waiting for deployments to be ready..."
+    kubectl wait --for=condition=available --timeout=120s deployment --all -n "$NAMESPACE" 2>/dev/null || true
+    echo
+fi
+
+# Show deployment status
+print_header "📊 Deployment Status"
+echo "Pods:"
+kubectl get pods -n "$NAMESPACE"
+echo
+echo "Services:"
+kubectl get svc -n "$NAMESPACE"
+echo
+
+# Show access instructions
+print_header "✅ Deployment Complete!"
+echo "📝 Next steps:"
+echo
+echo "1️⃣  View all resources:"
+echo "   kubectl get all -n $NAMESPACE"
+echo
+echo "2️⃣  View pod logs:"
+echo "   kubectl logs -n $NAMESPACE -l app=frontend --tail=50"
+echo "   kubectl logs -n $NAMESPACE -l app=backend --tail=50"
+echo
+echo "3️⃣  Port-forward to access services:"
+echo "   kubectl port-forward -n $NAMESPACE svc/${NAMESPACE}-frontend-service 8080:80"
+echo "   kubectl port-forward -n $NAMESPACE svc/${NAMESPACE}-backend-service 5000:5000"
+echo
+echo "4️⃣  Access your application:"
+echo "   Frontend: http://localhost:8080"
+echo "   Backend:  http://localhost:5000"
+echo
