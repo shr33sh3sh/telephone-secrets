@@ -1,0 +1,68 @@
+# File: docker-compose.yml
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: phone-directory-database
+    environment:
+      POSTGRES_DB: phone_directory
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"  # Host:Container
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - phone-network
+
+  # Backend (Flask API)
+  backend:
+    build: ./backend
+    container_name: phone-directory-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: phone_directory
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      SECRET_KEY: dev-secret-key-change-in-production  # Recommended to set a strong secret
+      FLASK_DEBUG: "true"
+    ports:
+      - "5001:5000"  # Expose Flask API on port 5001
+    volumes:
+      - ./backend:/app
+    networks:
+      - phone-network
+    restart: unless-stopped
+
+  # Frontend (Static HTML/JS served by Nginx)
+  frontend:
+    build: ./frontend
+    container_name: phone-directory-frontend
+    depends_on:
+      - backend  # Ensures backend is up (though not strictly required for static files)
+    ports:
+      - "80:80"  # Standard HTTP port on host
+    networks:
+      - phone-network
+    restart: unless-stopped
+
+networks:
+  phone-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

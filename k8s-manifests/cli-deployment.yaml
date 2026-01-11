@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telephone-cli
+  namespace: telephone
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telephone-cli
+  template:
+    metadata:
+      labels:
+        app: telephone-cli
+    spec:
+      containers:
+      - name: app
+        image: telephone-cli:17021
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: telephone-config
+        - secretRef:
+            name: telephone-secret
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 6

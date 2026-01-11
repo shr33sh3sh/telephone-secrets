@@ -1,0 +1,8 @@
+Flask==3.0.0
+flask-jwt-extended==4.6.0
+psycopg2-binary==2.9.9
+Werkzeug==3.0.1
+cryptography==41.0.7
+gunicorn==21.2.0
+flask-cors==4.0.0
+PyJWT==2.8.0
